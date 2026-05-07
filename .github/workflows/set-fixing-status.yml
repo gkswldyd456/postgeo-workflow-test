@@ -17,27 +17,55 @@ jobs:
       - name: PR body에서 이슈 번호 추출 후 Projects 개발상태 업데이트
         uses: actions/github-script@v7
         with:
-          # 기본 GITHUB_TOKEN은 org-project 변경 권한이 없을 수 있어
-          # PROJECTS_PAT (project 스코프 포함 PAT) 시크릿을 우선 사용
           github-token: ${{ secrets.PROJECTS_PAT || secrets.GITHUB_TOKEN }}
           script: |
             // ─ 설정 ────────────────────────────────────
-            // 개인 테스트 프로젝트 #5 ID
             const PROJECT_ID = 'PVT_kwHOBcajac4BVIW4';
+            const FIELD_NAME = '개발상태';
+            const TARGET_OPTION = '수정중';
             // ───────────────────────────────────────────
+
+            // 1) 프로젝트의 개발상태 필드/옵션 정보 (이슈 값 유무와 무관)
+            const projQ = await github.graphql(`
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on ProjectV2 {
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options { id name }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { id: PROJECT_ID });
+
+            const field = (projQ.node?.fields?.nodes || []).find(f => f?.name === FIELD_NAME);
+            if (!field) {
+              core.setFailed(`프로젝트에 '${FIELD_NAME}' 필드 없음`);
+              return;
+            }
+            const targetOpt = field.options.find(o => o.name.includes(TARGET_OPTION));
+            if (!targetOpt) {
+              core.setFailed(`'${TARGET_OPTION}' 옵션 없음`);
+              return;
+            }
 
             const body = context.payload.pull_request.body || '';
             const matches = body.match(/(?:fixes|closes|resolves)\s+#(\d+)/gi) || [];
             const issueNumbers = [...new Set(matches.map(m => parseInt(m.match(/\d+/)[0])))];
-
             if (issueNumbers.length === 0) {
               console.log('PR body에 fixes/closes/resolves #N 형식 이슈 참조가 없습니다.');
               return;
             }
-            console.log(`처리할 이슈 번호: ${issueNumbers.join(', ')}`);
+            console.log(`처리할 이슈: ${issueNumbers.join(', ')}`);
 
             for (const issueNum of issueNumbers) {
-              const issueData = await github.graphql(`
+              const q = await github.graphql(`
                 query($owner: String!, $repo: String!, $number: Int!) {
                   repository(owner: $owner, name: $repo) {
                     issue(number: $number) {
@@ -45,16 +73,8 @@ jobs:
                         nodes {
                           id
                           project { id }
-                          fieldValueByName(name: "개발상태") {
-                            ... on ProjectV2ItemFieldSingleSelectValue {
-                              optionId
-                              field {
-                                ... on ProjectV2SingleSelectField {
-                                  id
-                                  options { id name }
-                                }
-                              }
-                            }
+                          fieldValueByName(name: "${FIELD_NAME}") {
+                            ... on ProjectV2ItemFieldSingleSelectValue { optionId }
                           }
                         }
                       }
@@ -63,27 +83,14 @@ jobs:
                 }
               `, { owner: context.repo.owner, repo: context.repo.repo, number: issueNum });
 
-              const items = issueData.repository.issue?.projectItems?.nodes || [];
+              const items = q.repository.issue?.projectItems?.nodes || [];
               const item = items.find(i => i.project.id === PROJECT_ID);
               if (!item) {
-                console.log(`#${issueNum}: 대상 프로젝트(${PROJECT_ID})에 없음`);
+                console.log(`#${issueNum}: 프로젝트에 없음`);
                 continue;
               }
-
-              const fv = item.fieldValueByName;
-              if (!fv?.field?.options) {
-                console.log(`#${issueNum}: 개발상태 필드 옵션 조회 실패`);
-                continue;
-              }
-
-              const fixingOpt = fv.field.options.find(o => o.name.includes('수정중'));
-              if (!fixingOpt) {
-                console.log(`#${issueNum}: '수정중' 옵션 없음`);
-                continue;
-              }
-
-              if (fv.optionId === fixingOpt.id) {
-                console.log(`#${issueNum}: 이미 수정중`);
+              if (item.fieldValueByName?.optionId === targetOpt.id) {
+                console.log(`#${issueNum}: 이미 ${TARGET_OPTION}`);
                 continue;
               }
 
@@ -99,9 +106,8 @@ jobs:
               `, {
                 projectId: PROJECT_ID,
                 itemId: item.id,
-                fieldId: fv.field.id,
-                optionId: fixingOpt.id,
+                fieldId: field.id,
+                optionId: targetOpt.id,
               });
-
-              console.log(`#${issueNum} → 개발상태: 🔄수정중`);
+              console.log(`#${issueNum} → ${TARGET_OPTION}`);
             }
