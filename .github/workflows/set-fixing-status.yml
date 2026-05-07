@@ -14,7 +14,7 @@ jobs:
   set-fixing:
     runs-on: ubuntu-latest
     steps:
-      - name: PR body에서 이슈 번호 추출 후 Projects 개발상태 업데이트
+      - name: PR body에서 이슈 번호 추출 후 Projects 개발상태 업데이트 (서브이슈는 부모도 함께)
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PROJECTS_PAT || secrets.GITHUB_TOKEN }}
@@ -25,7 +25,7 @@ jobs:
             const TARGET_OPTION = '수정중';
             // ───────────────────────────────────────────
 
-            // 1) 프로젝트의 개발상태 필드/옵션 정보 (이슈 값 유무와 무관)
+            // 1) 프로젝트의 개발상태 필드/옵션 정보
             const projQ = await github.graphql(`
               query($id: ID!) {
                 node(id: $id) {
@@ -33,9 +33,7 @@ jobs:
                     fields(first: 50) {
                       nodes {
                         ... on ProjectV2SingleSelectField {
-                          id
-                          name
-                          options { id name }
+                          id name options { id name }
                         }
                       }
                     }
@@ -43,28 +41,41 @@ jobs:
                 }
               }
             `, { id: PROJECT_ID });
-
             const field = (projQ.node?.fields?.nodes || []).find(f => f?.name === FIELD_NAME);
-            if (!field) {
-              core.setFailed(`프로젝트에 '${FIELD_NAME}' 필드 없음`);
-              return;
-            }
+            if (!field) { core.setFailed(`'${FIELD_NAME}' 필드 없음`); return; }
             const targetOpt = field.options.find(o => o.name.includes(TARGET_OPTION));
-            if (!targetOpt) {
-              core.setFailed(`'${TARGET_OPTION}' 옵션 없음`);
-              return;
-            }
+            if (!targetOpt) { core.setFailed(`'${TARGET_OPTION}' 옵션 없음`); return; }
 
+            // 2) PR body에서 이슈 번호 추출
             const body = context.payload.pull_request.body || '';
             const matches = body.match(/(?:fixes|closes|resolves)\s+#(\d+)/gi) || [];
             const issueNumbers = [...new Set(matches.map(m => parseInt(m.match(/\d+/)[0])))];
             if (issueNumbers.length === 0) {
-              console.log('PR body에 fixes/closes/resolves #N 형식 이슈 참조가 없습니다.');
+              console.log('PR body에 fixes/closes/resolves #N 형식 이슈 참조 없음');
               return;
             }
-            console.log(`처리할 이슈: ${issueNumbers.join(', ')}`);
+            console.log(`PR에 명시된 이슈: ${issueNumbers.join(', ')}`);
 
-            for (const issueNum of issueNumbers) {
+            // 3) 각 이슈의 parent 추출 → 부모도 업데이트 대상에 포함
+            const targets = new Set(issueNumbers);
+            for (const n of issueNumbers) {
+              const r = await github.graphql(`
+                query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    issue(number: $number) { parent { number } }
+                  }
+                }
+              `, { owner: context.repo.owner, repo: context.repo.repo, number: n });
+              const parentNum = r.repository.issue?.parent?.number;
+              if (parentNum) {
+                targets.add(parentNum);
+                console.log(`#${n} 의 부모 #${parentNum} 도 업데이트 대상에 포함`);
+              }
+            }
+            console.log(`전체 업데이트 대상: ${[...targets].join(', ')}`);
+
+            // 4) 각 대상에 대해 개발상태 = 수정중
+            for (const issueNum of targets) {
               const q = await github.graphql(`
                 query($owner: String!, $repo: String!, $number: Int!) {
                   repository(owner: $owner, name: $repo) {
@@ -86,7 +97,7 @@ jobs:
               const items = q.repository.issue?.projectItems?.nodes || [];
               const item = items.find(i => i.project.id === PROJECT_ID);
               if (!item) {
-                console.log(`#${issueNum}: 프로젝트에 없음`);
+                console.log(`#${issueNum}: 프로젝트에 없음 (스킵)`);
                 continue;
               }
               if (item.fieldValueByName?.optionId === targetOpt.id) {
