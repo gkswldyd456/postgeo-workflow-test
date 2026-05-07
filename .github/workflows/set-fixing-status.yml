@@ -1,8 +1,8 @@
-name: PR 오픈 시 개발상태 수정중으로 변경
+name: PR 상태에 따라 개발상태 자동 변경
 
 on:
   pull_request:
-    types: [opened, reopened, edited, synchronize]
+    types: [opened, reopened, edited, synchronize, closed]
 
 permissions:
   contents: read
@@ -11,10 +11,10 @@ permissions:
   repository-projects: write
 
 jobs:
-  set-fixing:
+  update-dev-status:
     runs-on: ubuntu-latest
     steps:
-      - name: PR body에서 이슈 번호 추출 후 Projects 개발상태 업데이트 (서브이슈는 부모도 함께)
+      - name: PR 본문의 fixes/closes/resolves #N 추출 후 개발상태 업데이트
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PROJECTS_PAT || secrets.GITHUB_TOKEN }}
@@ -22,10 +22,28 @@ jobs:
             // ─ 설정 ────────────────────────────────────
             const PROJECT_ID = 'PVT_kwHOBcajac4BVIW4';
             const FIELD_NAME = '개발상태';
-            const TARGET_OPTION = '수정중';
             // ───────────────────────────────────────────
 
-            // 1) 프로젝트의 개발상태 필드/옵션 정보
+            const pr = context.payload.pull_request;
+            const action = context.payload.action;
+
+            // 어떤 옵션으로 변경할지 결정
+            //  - opened/reopened/edited/synchronize → '수정중'
+            //  - closed && !merged                 → '—' (되돌리기)
+            //  - closed && merged                  → 처리 안 함 (이슈 close 이벤트가 처리)
+            let targetName;
+            if (action === 'closed') {
+              if (pr.merged) {
+                console.log('PR 머지됨 — issues.closed 이벤트가 처리하므로 종료');
+                return;
+              }
+              targetName = '—';
+            } else {
+              targetName = '수정중';
+            }
+            console.log(`action=${action}, target=${targetName}`);
+
+            // 프로젝트의 개발상태 필드/옵션
             const projQ = await github.graphql(`
               query($id: ID!) {
                 node(id: $id) {
@@ -43,20 +61,24 @@ jobs:
             `, { id: PROJECT_ID });
             const field = (projQ.node?.fields?.nodes || []).find(f => f?.name === FIELD_NAME);
             if (!field) { core.setFailed(`'${FIELD_NAME}' 필드 없음`); return; }
-            const targetOpt = field.options.find(o => o.name.includes(TARGET_OPTION));
-            if (!targetOpt) { core.setFailed(`'${TARGET_OPTION}' 옵션 없음`); return; }
+            // '—' 옵션은 정확히 그 이름이거나 'none' 등으로 들어있을 수 있음
+            const targetOpt = field.options.find(o =>
+              targetName === '—'
+                ? (o.name === '—' || o.name === '-' || /^none$/i.test(o.name))
+                : o.name.includes(targetName)
+            );
+            if (!targetOpt) { core.setFailed(`'${targetName}' 옵션 없음`); return; }
 
-            // 2) PR body에서 이슈 번호 추출
-            const body = context.payload.pull_request.body || '';
+            const body = pr.body || '';
             const matches = body.match(/(?:fixes|closes|resolves)\s+#(\d+)/gi) || [];
             const issueNumbers = [...new Set(matches.map(m => parseInt(m.match(/\d+/)[0])))];
             if (issueNumbers.length === 0) {
               console.log('PR body에 fixes/closes/resolves #N 형식 이슈 참조 없음');
               return;
             }
-            console.log(`PR에 명시된 이슈: ${issueNumbers.join(', ')}`);
+            console.log(`PR fixes 대상: ${issueNumbers.join(', ')}`);
 
-            // 3) 각 이슈의 parent 추출 → 부모도 업데이트 대상에 포함
+            // 부모도 같이 업데이트 대상에 포함
             const targets = new Set(issueNumbers);
             for (const n of issueNumbers) {
               const r = await github.graphql(`
@@ -69,12 +91,11 @@ jobs:
               const parentNum = r.repository.issue?.parent?.number;
               if (parentNum) {
                 targets.add(parentNum);
-                console.log(`#${n} 의 부모 #${parentNum} 도 업데이트 대상에 포함`);
+                console.log(`#${n} 부모 #${parentNum} 도 포함`);
               }
             }
-            console.log(`전체 업데이트 대상: ${[...targets].join(', ')}`);
+            console.log(`전체 대상: ${[...targets].join(', ')}`);
 
-            // 4) 각 대상에 대해 개발상태 = 수정중
             for (const issueNum of targets) {
               const q = await github.graphql(`
                 query($owner: String!, $repo: String!, $number: Int!) {
@@ -93,15 +114,11 @@ jobs:
                   }
                 }
               `, { owner: context.repo.owner, repo: context.repo.repo, number: issueNum });
-
               const items = q.repository.issue?.projectItems?.nodes || [];
               const item = items.find(i => i.project.id === PROJECT_ID);
-              if (!item) {
-                console.log(`#${issueNum}: 프로젝트에 없음 (스킵)`);
-                continue;
-              }
+              if (!item) { console.log(`#${issueNum}: 프로젝트에 없음`); continue; }
               if (item.fieldValueByName?.optionId === targetOpt.id) {
-                console.log(`#${issueNum}: 이미 ${TARGET_OPTION}`);
+                console.log(`#${issueNum}: 이미 ${targetName}`);
                 continue;
               }
 
@@ -120,5 +137,5 @@ jobs:
                 fieldId: field.id,
                 optionId: targetOpt.id,
               });
-              console.log(`#${issueNum} → ${TARGET_OPTION}`);
+              console.log(`#${issueNum} → ${targetName}`);
             }
