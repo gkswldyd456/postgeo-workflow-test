@@ -20,45 +20,41 @@ jobs:
           script: |
             // ─ 설정 ────────────────────────────────────
             const PROJECT_ID = 'PVT_kwHOBcajac4BVIW4';
+            const FIELD_NAME = '개발상태';
+            const TARGET_OPTION = '수정완료';
             // ───────────────────────────────────────────
 
-            const closedIssueNumber = context.payload.issue.number;
-            console.log(`closed: #${closedIssueNumber}`);
+            const closedNum = context.payload.issue.number;
+            console.log(`closed: #${closedNum}`);
 
-            // 1) 닫힌 이슈가 서브이슈인지(=parent가 있는지) 확인
+            // 1) parent 있으면 → 부모 자동 close 검사
             const subQ = await github.graphql(`
               query($owner: String!, $repo: String!, $number: Int!) {
                 repository(owner: $owner, name: $repo) {
                   issue(number: $number) {
-                    parent { number id }
+                    parent { number }
                   }
                 }
               }
-            `, { owner: context.repo.owner, repo: context.repo.repo, number: closedIssueNumber });
+            `, { owner: context.repo.owner, repo: context.repo.repo, number: closedNum });
 
             const parent = subQ.repository.issue?.parent;
-
             if (parent) {
-              // 2) 부모의 모든 서브이슈 상태 확인
               const parentQ = await github.graphql(`
                 query($owner: String!, $repo: String!, $number: Int!) {
                   repository(owner: $owner, name: $repo) {
                     issue(number: $number) {
                       state
-                      subIssues(first: 100) {
-                        nodes { number state }
-                      }
+                      subIssues(first: 100) { nodes { state } }
                     }
                   }
                 }
               `, { owner: context.repo.owner, repo: context.repo.repo, number: parent.number });
-
               const p = parentQ.repository.issue;
               if (p.state !== 'CLOSED') {
                 const subs = p.subIssues.nodes;
                 const allClosed = subs.length > 0 && subs.every(s => s.state === 'CLOSED');
-                console.log(`부모 #${parent.number}: 서브 ${subs.filter(s => s.state==='CLOSED').length}/${subs.length}`);
-
+                console.log(`부모 #${parent.number}: ${subs.filter(s => s.state==='CLOSED').length}/${subs.length}`);
                 if (allClosed) {
                   await github.rest.issues.update({
                     owner: context.repo.owner,
@@ -66,17 +62,46 @@ jobs:
                     issue_number: parent.number,
                     state: 'closed',
                   });
-                  console.log(`부모 #${parent.number} 자동 close`);
-                  // 부모 close가 일어나면 같은 이벤트가 다시 트리거되므로
-                  // 개발상태 업데이트는 다음 트리거에서 처리됨. 여기서는 종료.
+                  console.log(`부모 #${parent.number} 자동 close — 다음 이벤트에서 개발상태 처리`);
+                  return;
+                } else {
+                  console.log(`아직 미완 서브이슈 있음 — 부모 close 안 함`);
                   return;
                 }
+              } else {
+                console.log(`부모 이미 CLOSED — 종료`);
+                return;
               }
             }
 
-            // 3) 닫힌 이슈가 부모이거나(서브이슈 다 닫혀서 자동 close 됐든 수동이든)
-            //    parent가 없는 일반 이슈인 경우 → 본인이 Projects에 있으면 개발상태=✅수정완료
-            const meQ = await github.graphql(`
+            // 2) parent 없는 이슈가 closed → Projects 개발상태=✅수정완료
+            const projQ = await github.graphql(`
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on ProjectV2 {
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id name options { id name }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { id: PROJECT_ID });
+            const field = (projQ.node?.fields?.nodes || []).find(f => f?.name === FIELD_NAME);
+            if (!field) {
+              console.log(`프로젝트에 '${FIELD_NAME}' 필드 없음`);
+              return;
+            }
+            const opt = field.options.find(o => o.name.includes(TARGET_OPTION));
+            if (!opt) {
+              console.log(`'${TARGET_OPTION}' 옵션 없음`);
+              return;
+            }
+
+            const itemQ = await github.graphql(`
               query($owner: String!, $repo: String!, $number: Int!) {
                 repository(owner: $owner, name: $repo) {
                   issue(number: $number) {
@@ -84,44 +109,23 @@ jobs:
                       nodes {
                         id
                         project { id }
-                        fieldValueByName(name: "개발상태") {
-                          ... on ProjectV2ItemFieldSingleSelectValue {
-                            optionId
-                            field {
-                              ... on ProjectV2SingleSelectField {
-                                id
-                                options { id name }
-                              }
-                            }
-                          }
+                        fieldValueByName(name: "${FIELD_NAME}") {
+                          ... on ProjectV2ItemFieldSingleSelectValue { optionId }
                         }
                       }
                     }
                   }
                 }
               }
-            `, { owner: context.repo.owner, repo: context.repo.repo, number: closedIssueNumber });
-
-            const items = meQ.repository.issue?.projectItems?.nodes || [];
+            `, { owner: context.repo.owner, repo: context.repo.repo, number: closedNum });
+            const items = itemQ.repository.issue?.projectItems?.nodes || [];
             const item = items.find(i => i.project.id === PROJECT_ID);
             if (!item) {
-              console.log(`#${closedIssueNumber}: 대상 프로젝트에 없음 (스킵)`);
+              console.log(`#${closedNum}: 프로젝트에 없음 — 스킵`);
               return;
             }
-
-            const fv = item.fieldValueByName;
-            if (!fv?.field?.options) {
-              console.log(`#${closedIssueNumber}: 개발상태 필드 옵션 조회 실패`);
-              return;
-            }
-
-            const doneOpt = fv.field.options.find(o => o.name.includes('수정완료'));
-            if (!doneOpt) {
-              console.log(`#${closedIssueNumber}: '수정완료' 옵션 없음`);
-              return;
-            }
-            if (fv.optionId === doneOpt.id) {
-              console.log(`#${closedIssueNumber}: 이미 수정완료`);
+            if (item.fieldValueByName?.optionId === opt.id) {
+              console.log(`#${closedNum}: 이미 ${TARGET_OPTION}`);
               return;
             }
 
@@ -137,8 +141,7 @@ jobs:
             `, {
               projectId: PROJECT_ID,
               itemId: item.id,
-              fieldId: fv.field.id,
-              optionId: doneOpt.id,
+              fieldId: field.id,
+              optionId: opt.id,
             });
-
-            console.log(`#${closedIssueNumber} → 개발상태: ✅수정완료`);
+            console.log(`#${closedNum} → ${TARGET_OPTION}`);
